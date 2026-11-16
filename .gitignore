@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+workspace/
+inbox/
+outbox/
+# local backups & personal settings
+.atlas-backup/
+.claude/settings.local.json
