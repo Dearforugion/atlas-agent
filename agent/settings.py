@@ -1,11 +1,58 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _augment_path() -> None:
+    """Добавляет локальные каталоги утилит в PATH процесса.
+
+    Python-инструменты ставятся в .venv\\Scripts, Go-утилиты — в
+    %USERPROFILE%\\go\\bin, обёртки ATLAS — в tools\\. Без этого
+    shutil.which() и дочерние процессы не видят установленные утилиты.
+    """
+    # Порядок важен: tools/ и go/bin идут раньше .venv\Scripts, иначе
+    # Python-пакет httpx перекрывает ProjectDiscovery httpx.
+    candidates = [
+        ROOT / "tools",
+        Path.home() / "go" / "bin",
+        ROOT / ".venv" / "Scripts",
+        ROOT / "tools" / "ruby" / "bin",
+        Path("C:/Program Files (x86)/Nmap"),
+        Path("C:/Program Files/Nmap"),
+        Path("C:/Program Files/Git/bin"),
+    ]
+    # Ruby может быть установлен в нестандартное место.
+    candidates.extend(Path(p) for p in glob.glob(r"C:\Ruby*\bin"))
+    candidates.extend(Path(p) for p in glob.glob(str(ROOT / "tools" / "ruby" / "rubyinstaller-*" / "bin")))
+
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    preferred: list[str] = []
+    preferred_keys: set[str] = set()
+    for directory in candidates:
+        try:
+            if not directory.is_dir():
+                continue
+        except OSError:
+            continue
+        key = str(directory).rstrip("\\/").lower()
+        if key not in preferred_keys:
+            preferred.append(str(directory))
+            preferred_keys.add(key)
+
+    # Убираем эти каталоги из старого PATH и ставим их в начало.
+    rest = [
+        p
+        for p in current
+        if p.rstrip("\\/").lower() not in preferred_keys
+    ]
+    if preferred:
+        os.environ["PATH"] = os.pathsep.join(preferred + rest)
 
 
 @dataclass
@@ -17,6 +64,7 @@ class LLMSettings:
     max_tokens: int = 8192
     timeout: int = 600
     native_tools: bool = True
+    stream: bool = True
 
 
 @dataclass
@@ -66,13 +114,18 @@ class Settings:
 
 
 def load_settings(path: Path | None = None) -> Settings:
+    _augment_path()
     config_path = Path(path) if path else ROOT / "config.json"
     raw: dict = {}
     if config_path.exists():
         try:
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            # utf-8-sig понимает и обычный UTF-8, и файл с BOM (его пишет
+            # PowerShell 5.1 при ConvertTo-Json | Set-Content).
+            raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Ошибка в {config_path}: {exc}") from exc
+        except OSError as exc:
+            raise SystemExit(f"Не удалось прочитать {config_path}: {exc}") from exc
 
     llm_raw = raw.pop("llm", {}) or {}
     fields = {
@@ -104,6 +157,8 @@ def load_settings(path: Path | None = None) -> Settings:
             "yes",
             "on",
         )
+    if os.getenv("ATLAS_NO_STREAM"):
+        settings.llm.stream = False
 
     if settings.confirm not in ("smart", "always", "never"):
         settings.confirm = "smart"

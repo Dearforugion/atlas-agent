@@ -57,4 +57,4 @@ def execute_tool(name: str, args: dict, ctx: Any) -> str:
 
 
 # Регистрация инструментов при импорте пакета.
-from . import audit, files, knowledge_tools, net, pentest, shell, subagent, web  # noqa: E402,F401
+from . import audit, files, knowledge_tools, net, pentest, pentest_extended, shell, subagent, web  # noqa: E402,F401

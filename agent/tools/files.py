@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
+import os
+import re
 import shutil
+import subprocess
+import tarfile
+import zipfile
 from itertools import islice
 from pathlib import Path
 
@@ -10,6 +16,9 @@ from ..paths import ensure_path, gate_if_outside
 from ..safety import is_inside
 from ..utils import read_text
 from . import tool
+
+MAX_ARCHIVE_ENTRIES = 20_000
+MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 
 MAX_READ_BYTES = 20_000_000
 
@@ -345,3 +354,225 @@ def hash_file(args: dict, ctx) -> str:
         f"SHA-1:  {sha1.hexdigest()}\n"
         f"SHA-256: {sha256.hexdigest()}"
     )
+
+
+def _strip_archive_suffix(name: str) -> str:
+    lower = name.lower()
+    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz"):
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem
+
+
+def _archive_target(root: Path, member: str) -> Path:
+    name = str(member or "").replace("\\", "/").lstrip("/")
+    if re.match(r"^[A-Za-z]:", name) or name.startswith("//"):
+        raise ToolError(f"Абсолютный путь в архиве запрещён: {member}")
+    target = (root / name).resolve()
+    if not is_inside(root, target):
+        raise ToolError(f"Архив пытается выйти за пределы папки распаковки: {member}")
+    return target
+
+
+def _zip_extract(archive: Path, dest: Path) -> tuple[int, int, int]:
+    files = 0
+    dirs = 0
+    skipped = 0
+    total = 0
+    with zipfile.ZipFile(archive) as zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise ToolError(
+                f"В архиве {len(infos)} записей — больше лимита {MAX_ARCHIVE_ENTRIES}."
+            )
+        for info in infos:
+            target = _archive_target(dest, info.filename)
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                dirs += 1
+                continue
+            total += int(info.file_size)
+            if total > MAX_ARCHIVE_BYTES:
+                raise ToolError("Распакованный архив превысил лимит 4 ГБ.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with zf.open(info) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+            except (RuntimeError, NotImplementedError) as exc:
+                raise ToolError(
+                    f"Не удалось распаковать {info.filename}: {exc}. "
+                    "Возможно, архив зашифрован или использует неподдерживаемое сжатие."
+                ) from exc
+            files += 1
+    return files, dirs, skipped
+
+
+def _tar_extract(archive: Path, dest: Path) -> tuple[int, int, int]:
+    files = 0
+    dirs = 0
+    skipped = 0
+    total = 0
+    with tarfile.open(archive, "r:*") as tf:
+        members = tf.getmembers()
+        if len(members) > MAX_ARCHIVE_ENTRIES:
+            raise ToolError(
+                f"В архиве {len(members)} записей — больше лимита {MAX_ARCHIVE_ENTRIES}."
+            )
+        for member in members:
+            target = _archive_target(dest, member.name)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                dirs += 1
+                continue
+            if not member.isfile():
+                # Симлинки и устройства пропускаем: они позволяют выйти
+                # за пределы папки распаковки.
+                skipped += 1
+                continue
+            total += int(member.size)
+            if total > MAX_ARCHIVE_BYTES:
+                raise ToolError("Распакованный архив превысил лимит 4 ГБ.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = tf.extractfile(member)
+            if source is None:
+                skipped += 1
+                continue
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output, 1024 * 1024)
+            files += 1
+    return files, dirs, skipped
+
+
+def _seven_zip() -> str | None:
+    found = shutil.which("7z") or shutil.which("7za") or shutil.which("7zr")
+    if found:
+        return found
+    candidates = [
+        Path(os.environ.get("ProgramFiles", "")) / "7-Zip" / "7z.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "7-Zip" / "7z.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+@tool(
+    "extract_archive",
+    "Распаковать архив в рабочую папку: zip, tar, tar.gz/tgz, gz, а также 7z/rar "
+    "при установленном 7-Zip. Защищено от zip-slip и архивных бомб.",
+    {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Путь к архиву"},
+            "dest": {
+                "type": "string",
+                "description": "Папка распаковки. По умолчанию — рядом с архивом, по имени архива",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Разрешить распаковку в непустую папку",
+            },
+        },
+        "required": ["path"],
+    },
+)
+def extract_archive(args: dict, ctx) -> str:
+    archive = ensure_path(ctx, args.get("path"), must_exist=True)
+    if not archive.is_file():
+        raise ToolError(f"Это не файл: {_display(ctx, archive)}")
+    name = archive.name.lower()
+
+    if name.endswith((".zip",)):
+        kind = "zip"
+    elif name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        kind = "tar"
+    elif name.endswith(".gz"):
+        kind = "gz"
+    elif name.endswith((".7z", ".rar")):
+        kind = "7z"
+    else:
+        raise ToolError(
+            "Неизвестный формат архива. Поддерживаются: zip, tar, tar.gz/tgz, "
+            "tar.bz2, tar.xz, gz, 7z и rar (для 7z/rar нужен 7-Zip)."
+        )
+
+    raw_dest = str(args.get("dest") or "").strip()
+    if raw_dest:
+        dest = ensure_path(ctx, raw_dest)
+    else:
+        dest = archive.parent / _strip_archive_suffix(archive.name)
+    gate_if_outside(ctx, dest, "Распаковка архива")
+
+    if dest.exists() and not dest.is_dir():
+        raise ToolError(f"Цель распаковки — файл, а не папка: {_display(ctx, dest)}")
+    if dest.is_dir() and any(dest.iterdir()) and not bool(args.get("overwrite")):
+        raise ToolError(
+            f"Папка распаковки не пуста: {_display(ctx, dest)}. "
+            "Укажи overwrite=true или другую папку dest."
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+
+    skipped = 0
+    try:
+        if kind == "zip":
+            files, dirs, skipped = _zip_extract(archive, dest)
+        elif kind == "tar":
+            files, dirs, skipped = _tar_extract(archive, dest)
+        elif kind == "gz":
+            target = _archive_target(dest, _strip_archive_suffix(archive.name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            total = 0
+            with gzip.open(archive, "rb") as source, target.open("wb") as output:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_ARCHIVE_BYTES:
+                        raise ToolError("Распакованный файл превысил лимит 4 ГБ.")
+                    output.write(chunk)
+            files, dirs = 1, 0
+        else:
+            binary = _seven_zip()
+            if not binary:
+                raise ToolError(
+                    "Для 7z/rar нужен 7-Zip: установи его или распакуй архив вручную. "
+                    "zip и tar распаковываются без внешних программ."
+                )
+            result = subprocess.run(
+                [binary, "x", "-y", f"-o{dest}", str(archive)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+            )
+            if result.returncode != 0:
+                raise ToolError(
+                    f"7-Zip вернул код {result.returncode}: "
+                    f"{(result.stderr or result.stdout or '').strip()[:800]}"
+                )
+            files = sum(1 for item in dest.rglob("*") if item.is_file())
+            dirs = sum(1 for item in dest.rglob("*") if item.is_dir())
+    except ToolError:
+        raise
+    except (tarfile.TarError, zipfile.BadZipFile, OSError, EOFError) as exc:
+        raise ToolError(f"Не удалось распаковать {_display(ctx, archive)}: {exc}") from exc
+
+    ctx.audit.write(
+        "extract_archive",
+        path=str(archive),
+        dest=str(dest),
+        files=files,
+        skipped=skipped,
+        format=kind,
+    )
+    result = (
+        f"Распаковано: {_display(ctx, dest)}\n"
+        f"Формат: {kind}\n"
+        f"Файлов: {files}, папок: {dirs}"
+    )
+    if skipped:
+        result += f"\nПропущено ссылок/устройств: {skipped}"
+    return result

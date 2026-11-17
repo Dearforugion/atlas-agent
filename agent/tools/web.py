@@ -168,38 +168,200 @@ def web_search(args: dict, ctx) -> str:
     if not query:
         raise ToolError("Пустой поисковый запрос.")
     limit = max(1, min(10, int(args.get("max_results") or 6)))
-    search_url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+    allow_private = ctx.settings.allow_private_web
 
-    final_url, content_type, data = _fetch(search_url, allow_private=ctx.settings.allow_private_web)
-    markup = _decode_body(data, content_type)
-    anchor_re = re.compile(
-        r"<a\b([^>]*\bclass=\"[^\"]*result__a[^\"]*\"[^>]*)>(.*?)</a>",
-        re.S | re.I,
+    engines = (
+        ("duckduckgo", _search_ddg_html, "https://html.duckduckgo.com/html/?q="),
+        ("duckduckgo-lite", _search_ddg_lite, "https://lite.duckduckgo.com/lite/?q="),
     )
-    results: list[str] = []
+    problems: list[str] = []
+    for engine, parser, base in engines:
+        url = base + urllib.parse.quote_plus(query)
+        try:
+            _, content_type, data = _fetch(url, allow_private=allow_private)
+            markup = _decode_body(data, content_type)
+            results = parser(markup, limit)
+        except ToolError as exc:
+            problems.append(f"{engine}: {exc}")
+            continue
+        if results:
+            ctx.audit.write("web_search", query=query, results=len(results), engine=engine)
+            return f"Результаты по запросу «{query}»:\n\n" + "\n".join(results)
+        problems.append(f"{engine}: пустой результат")
+
+    ctx.audit.write("web_search", query=query, results=0, errors=problems)
+    return (
+        "Поисковик не вернул результатов (возможно, ограничил запрос). "
+        "Попробуй сформулировать иначе, открой известную ссылку через web_fetch "
+        "или запроси страницу через run_shell. Детали: " + "; ".join(problems)
+    )
+
+
+def _search_ddg_html(markup: str, limit: int) -> list[str]:
+    return _extract_anchors(markup, "result__a", limit)
+
+
+def _search_ddg_lite(markup: str, limit: int) -> list[str]:
+    return _extract_anchors(markup, "result-link", limit)
+
+
+_ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.S | re.I)
+
+
+def _extract_links(markup: str, class_token: str, limit: int) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for match in anchor_re.finditer(markup):
-        attrs, inner = match.group(1), match.group(2)
-        href_match = re.search(r"href=\"([^\"]+)\"", attrs, re.I)
+    for attrs, inner in _ANCHOR_RE.findall(markup):
+        class_match = re.search(r"\bclass\s*=\s*['\"]([^'\"]*)['\"]", attrs, re.I)
+        if not class_match or class_token not in class_match.group(1):
+            continue
+        href_match = re.search(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", attrs, re.I)
         if not href_match:
             continue
-        href = html.unescape(href_match.group(1))
-        href = _unwrap_ddg(href)
+        href = _unwrap_ddg(html.unescape(href_match.group(1)))
         title = html.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
-        if not href.startswith(("http://", "https://")) or href in seen:
+        if not href.startswith(("http://", "https://")) or not title or href in seen:
             continue
         seen.add(href)
-        results.append(f"{len(results) + 1}. {title}\n   {href}")
+        results.append((title, href))
         if len(results) >= limit:
             break
+    return results
 
-    ctx.audit.write("web_search", query=query, results=len(results))
-    if not results:
-        return (
-            "Поисковик не вернул результатов (возможно, ограничил запрос). "
-            "Попробуй сформулировать иначе или используй web_fetch по известной ссылке."
+
+def _extract_anchors(markup: str, class_token: str, limit: int) -> list[str]:
+    return [
+        f"{index}. {title}\n   {url}"
+        for index, (title, url) in enumerate(
+            _extract_links(markup, class_token, limit), 1
         )
-    return f"Результаты по запросу «{query}»:\n\n" + "\n".join(results)
+    ]
+
+
+def _search_links(
+    query: str, limit: int, allow_private: bool
+) -> tuple[list[tuple[str, str]], list[str]]:
+    engines = (
+        (_search_ddg_html_links, "https://html.duckduckgo.com/html/?q="),
+        (_search_ddg_lite_links, "https://lite.duckduckgo.com/lite/?q="),
+    )
+    problems: list[str] = []
+    for parser, base in engines:
+        url = base + urllib.parse.quote_plus(query)
+        try:
+            _, content_type, data = _fetch(url, allow_private=allow_private)
+            markup = _decode_body(data, content_type)
+            links = parser(markup, limit)
+        except ToolError as exc:
+            problems.append(str(exc))
+            continue
+        if links:
+            return links, problems
+        problems.append("пустой результат")
+    return [], problems
+
+
+def _search_ddg_html_links(markup: str, limit: int) -> list[tuple[str, str]]:
+    return _extract_links(markup, "result__a", limit)
+
+
+def _search_ddg_lite_links(markup: str, limit: int) -> list[tuple[str, str]]:
+    return _extract_links(markup, "result-link", limit)
+
+
+def _error_excerpt(text: str, needles: list[str], limit: int) -> str:
+    lowered = text.lower()
+    for needle in needles:
+        needle = needle.strip().lower()
+        if len(needle) < 4:
+            continue
+        position = lowered.find(needle)
+        if position < 0:
+            continue
+        start = max(0, position - 300)
+        excerpt = text[start:start + limit].strip()
+        return ("…" if start else "") + excerpt
+    return text[:limit].strip()
+
+
+@tool(
+    "research_error",
+    "Исследовать ошибку в интернете: найти страницы с решением, открыть лучшие "
+    "и вернуть выдержки. Используй, когда инструмент или команда падает, а "
+    "причина неочевидна.",
+    {
+        "type": "object",
+        "properties": {
+            "error": {"type": "string", "description": "Текст ошибки или ключевая строка вывода"},
+            "context": {"type": "string", "description": "Что запускали: инструмент, команда, ОС"},
+            "max_pages": {
+                "type": "integer",
+                "description": "Сколько страниц открыть для выдержек (1-3, по умолчанию 2)",
+            },
+        },
+        "required": ["error"],
+    },
+)
+def research_error(args: dict, ctx) -> str:
+    error = re.sub(r"\s+", " ", str(args.get("error") or "")).strip()
+    if not error:
+        raise ToolError("Пустой текст ошибки.")
+    context = re.sub(r"\s+", " ", str(args.get("context") or "")).strip()
+    pages = max(1, min(3, int(args.get("max_pages") or 2)))
+    allow_private = ctx.settings.allow_private_web
+
+    query = error[:220]
+    if context:
+        query = f"{query} {context[:120]}"
+    query = f"{query} fix solution"
+
+    links, problems = _search_links(query, 6, allow_private)
+    if not links:
+        # Второй заход с более коротким запросом — поисковики лучше
+        # реагируют на пару ключевых слов, чем на длинную строку.
+        short = " ".join(re.findall(r"[A-Za-zА-Яа-я0-9_.-]{4,}", error)[:6])
+        if short and short.lower() != query.lower():
+            links, problems2 = _search_links(short, 6, allow_private)
+            problems += problems2
+    if not links:
+        ctx.audit.write("research_error", error=error[:300], results=0)
+        return (
+            "Поиск не дал результатов. Попробуй сформулировать ошибку короче, "
+            "проверить официальную документацию инструмента или выполнить "
+            "команду с флагом диагностики. Детали: " + "; ".join(problems)
+        )
+
+    needles = [error[:80]] + [
+        token for token in re.findall(r"[A-Za-zА-Яа-я0-9_.-]{5,}", error)[:8]
+    ]
+    parts = [f"Запрос: {query}", "Источники:"]
+    for index, (title, url) in enumerate(links, 1):
+        parts.append(f"{index}. {title}\n   {url}")
+
+    opened = 0
+    for title, url in links:
+        if opened >= pages:
+            break
+        try:
+            final_url, content_type, data = _fetch(url, allow_private=allow_private)
+        except ToolError as exc:
+            parts.append(f"\n[не открылось] {url}: {exc}")
+            continue
+        text = _decode_body(data, content_type)
+        if "html" in content_type.lower() or text.lstrip().lower().startswith(("<!doctype", "<html")):
+            text = _html_to_text(text)
+        excerpt = _error_excerpt(text, needles, 1500)
+        if not excerpt:
+            continue
+        opened += 1
+        parts.append(f"\nФрагмент: {final_url}\n{excerpt}")
+
+    ctx.audit.write("research_error", error=error[:300], results=len(links), opened=opened)
+    if not opened:
+        parts.append(
+            "\nНе удалось открыть страницы — используй ссылки выше через web_fetch."
+        )
+    return "\n".join(parts)
 
 
 def _unwrap_ddg(href: str) -> str:

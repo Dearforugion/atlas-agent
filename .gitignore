@@ -5,6 +5,30 @@ data/
 workspace/
 inbox/
 outbox/
-# local backups & personal settings
+
+# local tool installations and downloaded binaries (large, machine-specific)
+/tools/
+
+# secrets and local environment
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+
+# local backups and personal settings
 .atlas-backup/
 .claude/settings.local.json
+*.bak
+*.log
+agent/tools/.backup/
+skills/.backup/
+start-original.bat
+
+# editors / OS
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db

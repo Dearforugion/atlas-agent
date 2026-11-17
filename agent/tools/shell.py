@@ -10,6 +10,7 @@ from ..errors import ToolError
 from ..paths import ensure_path
 from ..safety import dangerous_reason, offensive_tool_in
 from ..scope import extract_candidate_targets, is_local_lab_target, load_scope
+from ..settings import ROOT
 from ..utils import decode_output, write_text
 from . import tool
 
@@ -86,9 +87,19 @@ def run_shell(args: dict, ctx) -> str:
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    # Команды python/pip должны работать в личном окружении агента.
+    # Команды python/pip должны работать в личном окружении агента, но
+    # Go-утилиты (httpx и др.) должны идти раньше Python-скриптов с теми же
+    # именами: в .venv\Scripts есть httpx.exe из PyPI.
     venv_scripts = Path(sys.executable).resolve().parent
-    env["PATH"] = str(venv_scripts) + os.pathsep + env.get("PATH", "")
+    preferred = [ROOT / "tools", Path.home() / "go" / "bin", venv_scripts]
+    preferred = [p for p in preferred if p.is_dir()]
+    keys = {str(p).rstrip("\\/").lower() for p in preferred}
+    rest = [
+        p
+        for p in env.get("PATH", "").split(os.pathsep)
+        if p and p.rstrip("\\/").lower() not in keys
+    ]
+    env["PATH"] = os.pathsep.join([str(p) for p in preferred] + rest)
     env["VIRTUAL_ENV"] = str(venv_scripts.parent)
 
     ctx.audit.write("run_shell", command=command, cwd=str(cwd))

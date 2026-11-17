@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..errors import ToolError
-from ..knowledge import Memory, Skills
+from ..knowledge import Lessons, Memory, Skills
 from . import tool
 
 
@@ -168,3 +168,95 @@ def delete_skill(args: dict, ctx) -> str:
         raise ToolError(f"Навык «{name}» не найден.")
     ctx.audit.write("delete_skill", name=name)
     return f"Навык удалён: {name}"
+
+
+@tool(
+    "lesson_save",
+    "Сохранить урок: какая ошибка возникла и какое решение реально помогло. "
+    "Используй после того, как нашёл и применил исправление проблемы, чтобы не "
+    "повторять её в будущем.",
+    {
+        "type": "object",
+        "properties": {
+            "problem": {"type": "string", "description": "Симптом или текст ошибки"},
+            "solution": {"type": "string", "description": "Что именно помогло: команды, настройки, обход"},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Теги для поиска, например ['python', 'path', 'windows']",
+            },
+            "source": {"type": "string", "description": "Ссылка на документацию или issue, если была"},
+        },
+        "required": ["problem", "solution"],
+    },
+)
+def lesson_save(args: dict, ctx) -> str:
+    problem = str(args.get("problem") or "").strip()
+    solution = str(args.get("solution") or "").strip()
+    if not problem or not solution:
+        raise ToolError("Нужны problem и solution.")
+    tags = args.get("tags") or []
+    if not isinstance(tags, list):
+        tags = [str(tags)]
+    try:
+        record, created = Lessons(ctx.lessons_path).add(
+            problem, solution, tags, str(args.get("source") or "")
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    ctx.audit.write("lesson_save", record_id=record["id"], created=created)
+    action = "Сохранён новый урок" if created else "Обновлён урок"
+    return f"{action} ({record['id']}): {problem[:160]}"
+
+
+@tool(
+    "lesson_search",
+    "Найти в уроках самообучения похожую ошибку и готовое решение. "
+    "Вызывай перед тем, как чинить проблему, с которой уже мог сталкиваться.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Текст ошибки, инструмент или симптом"},
+            "limit": {"type": "integer", "description": "Сколько уроков вернуть (до 10)"},
+        },
+        "required": ["query"],
+    },
+)
+def lesson_search(args: dict, ctx) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise ToolError("Пустой запрос.")
+    limit = max(1, min(10, int(args.get("limit") or 3)))
+    records = Lessons(ctx.lessons_path).search(query, limit=limit)
+    if not records:
+        return "Похожих уроков нет. Если найдёшь решение — сохрани его через lesson_save."
+    parts = []
+    for record in records:
+        parts.append(
+            f"[{record['id']}] {record.get('problem', '')}\n"
+            f"  Решение: {record.get('solution', '')}"
+            + (f"\n  Источник: {record['source']}" if record.get("source") else "")
+        )
+    return "Найденные уроки:\n\n" + "\n\n".join(parts)
+
+
+@tool(
+    "lesson_list",
+    "Показать последние сохранённые уроки самообучения.",
+    {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Сколько уроков показать (до 50)"},
+        },
+    },
+)
+def lesson_list(args: dict, ctx) -> str:
+    limit = max(1, min(50, int(args.get("limit") or 10)))
+    records = Lessons(ctx.lessons_path).recent(limit)
+    if not records:
+        return "Уроков пока нет."
+    return "\n".join(
+        f"{record['id']} [{record.get('ts', '')}] {record.get('problem', '')} -> "
+        f"{record.get('solution', '')}"
+        for record in records
+    )

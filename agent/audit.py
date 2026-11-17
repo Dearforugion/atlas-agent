@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from .utils import now_iso
@@ -12,11 +13,12 @@ class AuditLog:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     def write(self, kind: str, **data) -> None:
         record = {"ts": now_iso(), "kind": kind, **data}
         try:
-            with self.path.open("a", encoding="utf-8") as handle:
+            with self._lock, self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         except OSError:
             pass

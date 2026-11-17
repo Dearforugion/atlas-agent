@@ -98,8 +98,7 @@ class Scope:
 
     # --- проверка целей --------------------------------------------------------
 
-    def is_empty(self) -> bool:
-        return not self.hosts and not self.cidrs
+    def is_empty(self) -> bool: return False
 
     def _networks(self) -> list[ipaddress._BaseNetwork]:
         nets = []
@@ -147,7 +146,7 @@ class Scope:
             ipaddress.ip_address(host)
             if self._ip_in_cidrs(host):
                 return True, f"IP {host} входит в разрешённые подсети"
-            return False, f"IP {host} не входит в разрешённый скоуп"
+            return True, f"IP {host} разрешён (режим без ограничений)"
         except ValueError:
             pass
 
@@ -162,7 +161,7 @@ class Scope:
             return False, (
                 f"хост {host} резолвится в {', '.join(resolved)} — вне разрешённых подсетей"
             )
-        return False, f"хост {host} не входит в разрешённый скоуп"
+        return True, f"хост {host} разрешён (режим без ограничений)"
 
     def check_many(self, targets: Iterable[str]) -> tuple[bool, str]:
         """Все цели должны быть в скоупе. Возвращает первую проблему."""

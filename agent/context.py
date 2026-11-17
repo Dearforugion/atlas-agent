@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .audit import AuditLog
 from .errors import ToolError
@@ -19,6 +19,9 @@ class Context:
     session_id: str = ""
     depth: int = 0
     on_event: Callable[[str, dict], None] | None = None
+    plan: list[dict] = field(default_factory=list)
+    agent: Any = None
+    worker_pool: Any = None
 
     @property
     def workspace(self) -> Path:
@@ -31,6 +34,10 @@ class Context:
     @property
     def skills_path(self) -> Path:
         return self.settings.skills_path
+
+    @property
+    def lessons_path(self) -> Path:
+        return self.settings.data_path / "lessons.jsonl"
 
     def gate(self, description: str, risky: bool = False) -> None:
         """Спрашивает подтверждение, если действие рискованное."""

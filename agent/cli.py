@@ -14,18 +14,21 @@ from . import __version__
 from .core import Agent
 from .daemon import run_daemon
 from .doctor import run_doctor
-from .errors import LLMError
-from .knowledge import Memory, Skills
+from .errors import LLMError, ToolError
+from .knowledge import Lessons, Memory, Skills
 from .metrics import (
     Metrics,
     default_llm_seconds,
     default_tool_seconds,
     format_seconds,
 )
+from .panel import PanelSession
 from .profiles import PROFILES, Profile, get_profile
 from .scope import clean_host_pattern, load_scope, normalize_target
 from .selftest import run_selftest
 from .settings import ROOT, Settings, load_settings
+from .tools import execute_tool
+from .tools.subagent import add_background_workers
 from .utils import now_iso, preview, read_text, write_text
 
 _COLOR = False
@@ -54,6 +57,149 @@ def _style(text: str, code: str) -> str:
 def _unicode_ok() -> bool:
     encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
     return "utf" in encoding
+
+
+_INLINE_RE = re.compile(
+    r"(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\n]+\))"
+)
+
+_EXIT_RE = re.compile(r"^\s*exit code:\s*(-?\d+)", re.IGNORECASE | re.MULTILINE)
+_IMPORTANT_HINTS = (
+    "error",
+    "exception",
+    "traceback",
+    "failed",
+    "failure",
+    "not found",
+    "denied",
+    "timeout",
+    "cannot",
+    "successfully",
+    "installed",
+    "готово",
+    "успешно",
+    "ошибка",
+    "не удалось",
+    "не найден",
+)
+
+
+def _exit_code(output: str) -> int | None:
+    match = _EXIT_RE.search(output or "")
+    return int(match.group(1)) if match else None
+
+
+def _preview_lines(output: str, limit: int = 4) -> list[str]:
+    """Выбирает начало, конец и важные строки вывода, сохраняя порядок."""
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if len(lines) <= limit:
+        return lines
+    chosen: set[int] = {0, len(lines) - 1}
+    for index, line in enumerate(lines):
+        if len(chosen) >= limit:
+            break
+        low = line.lower()
+        if any(hint in low for hint in _IMPORTANT_HINTS):
+            chosen.add(index)
+    for index in range(len(lines)):
+        if len(chosen) >= limit:
+            break
+        chosen.add(index)
+    return [lines[index] for index in sorted(chosen)[:limit]]
+
+
+def _inline_md(text: str) -> str:
+    """Лёгкий markdown для одной строки: код, жирный, курсив, ссылки."""
+
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        if token.startswith("`"):
+            return _style(token[1:-1], "33")
+        if token.startswith("**") or token.startswith("__"):
+            return _style(token[2:-2], "1")
+        if token.startswith("[") and "](" in token:
+            label, _, url = token[1:-1].partition("](")
+            return _style(label, "4") + " " + _style(f"({url})", "2")
+        if token.startswith("*"):
+            return _style(token[1:-1], "3")
+        return token
+
+    return _INLINE_RE.sub(repl, text)
+
+
+class _MarkdownStream:
+    """Построчный markdown-рендер для потока токенов.
+
+    Строка выводится, когда завершена, либо когда стала совсем длинной —
+    тогда текст не «залипает» в буфере на длинном абзаце.
+    """
+
+    MAX_PARTIAL = 140
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._fence = False
+        self._mid = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                out.append(self._render_line(line) + "\n")
+                self._mid = False
+                continue
+            if len(self._buf) >= self.MAX_PARTIAL:
+                out.append(self._render_partial(self._buf))
+                self._buf = ""
+                self._mid = True
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        if not self._buf:
+            return ""
+        line, self._buf = self._buf, ""
+        self._mid = False
+        return self._render_line(line)
+
+    def _render_line(self, line: str) -> str:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            self._fence = not self._fence
+            return _style(line, "2")
+        if self._fence:
+            return _style(line, "36")
+        if stripped and not re.search(r"[A-Za-zА-Яа-я0-9]", stripped) and re.fullmatch(r"[\s\-*_=]{3,}", stripped):
+            return _style(("─" if _unicode_ok() else "-") * 46, "2")
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            return _style(_inline_md(heading.group(2)), "1;36")
+        quote = re.match(r"^(\s*)>\s?(.*)$", line)
+        if quote:
+            bar = "│" if _unicode_ok() else "|"
+            return f"{quote.group(1)}{_style(bar, '36')} {_inline_md(quote.group(2))}"
+        bullet = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
+        if bullet:
+            dot = "•" if _unicode_ok() else "-"
+            return f"{bullet.group(1)}{_style(dot, '36')} {_inline_md(bullet.group(2))}"
+        return _inline_md(line)
+
+    def _render_partial(self, text: str) -> str:
+        if self._fence:
+            return _style(text, "36")
+        if not self._mid:
+            heading = re.match(r"^(#{1,6})\s+(.*)$", text)
+            if heading:
+                return _style(_inline_md(heading.group(2)), "1;36")
+            bullet = re.match(r"^(\s*)[-*+]\s+(.*)$", text)
+            if bullet:
+                dot = "•" if _unicode_ok() else "-"
+                return f"{bullet.group(1)}{_style(dot, '36')} {_inline_md(bullet.group(2))}"
+        return _inline_md(text)
 
 
 class StatusLine:
@@ -164,7 +310,7 @@ class StatusLine:
 
 
 class ConsoleRenderer:
-    """Печатает события агента, ведёт статус и считает ETA."""
+    """Печатает события агента: поток ответа, карточки инструментов, статусы."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -173,6 +319,12 @@ class ConsoleRenderer:
         self.step = 0
         self._root_started: float | None = None
         self._summary = ""
+        self._out = sys.stdout
+        self._stream_open = False
+        self._stream_buf = ""
+        self._last_stream = ""
+        self._md = _MarkdownStream()
+        self._lock = threading.RLock()
 
     @property
     def interactive(self) -> bool:
@@ -199,51 +351,193 @@ class ConsoleRenderer:
         self._summary = ""
         return text
 
+    def _write_raw(self, text: str) -> None:
+        try:
+            self._out.write(text)
+            self._out.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _start_stream(self) -> None:
+        if self._stream_open:
+            return
+        self.status.end()
+        self._md = _MarkdownStream()
+        self._stream_buf = ""
+        self._write_raw("\n" + _style(f"{self.settings.name} > ", "1;36"))
+        self._stream_open = True
+
+    def _write_token(self, text: str) -> None:
+        if not text:
+            return
+        self._start_stream()
+        rendered = self._md.feed(text)
+        if rendered:
+            self._write_raw(rendered)
+        self._stream_buf += text
+
+    def _close_stream(self) -> None:
+        if not self._stream_open:
+            return
+        tail = self._md.flush()
+        if tail:
+            self._write_raw(tail)
+        self._write_raw("\n")
+        self._stream_open = False
+        self._last_stream = self._stream_buf
+        self._stream_buf = ""
+
+    def answer_visible(self, text: str) -> bool:
+        return bool(self._last_stream) and text.strip() == self._last_stream.strip()
+
+    @staticmethod
+    def _worker_label(data: dict) -> str:
+        worker = data.get("worker")
+        return f"помощник {worker}" if worker not in (None, "") else "помощник"
+
+    def _handle_tool_call(self, data: dict, depth: int) -> None:
+        name = str(data.get("name") or "инструмент")
+        args = json.dumps(data.get("args", {}), ensure_ascii=False, default=str)
+        detail = preview(args.replace("\n", " "), 220)
+        if depth == 0:
+            width = 64
+            line = "  ╭─ " + name + " " + "─" * max(3, width - len(name) - 5)
+            self.status.write(_style(line, "36"))
+            if detail.strip() and detail.strip() != "{}":
+                self.status.write(_style(f"  │ {detail}", "2"))
+        else:
+            self.status.write(
+                _style(f"  [{self._worker_label(data)}] {name} {detail}", "35")
+            )
+        if depth == 0 or self.interactive:
+            self.status.begin(
+                f"{'подагент: ' if depth else ''}выполняю {name}",
+                self.metrics.average("tool", name, default=default_tool_seconds(name)),
+            )
+
+    def _handle_tool_result(self, data: dict, depth: int) -> None:
+        name = str(data.get("name") or "инструмент")
+        ok = bool(data.get("ok"))
+        seconds = float(data.get("seconds") or 0)
+        self.metrics.observe("tool", name, seconds)
+        output = str(data.get("output") or "").replace("\r", "")
+        code = _exit_code(output) if name in ("run_shell", "run_python") else None
+        if not ok:
+            color, label = "31", "ошибка"
+        elif code not in (None, 0):
+            color, label = "33", f"exit {code}"
+        else:
+            color, label = "32", "ok"
+        lines = _preview_lines(output, 4)
+        total = sum(1 for line in output.splitlines() if line.strip())
+        if depth == 0:
+            self.status.write(_style(f"  ╰─ {label} · {format_seconds(seconds)}", color))
+            for line in lines:
+                self.status.write(_style(f"     {preview(line, 170)}", "2"))
+            if total > len(lines):
+                self.status.write(_style(f"     … скрыто строк: {total - len(lines)}", "2"))
+        else:
+            flat = preview(" | ".join(lines), 150)
+            self.status.write(
+                _style(
+                    f"  [{self._worker_label(data)}] {name}: {label} · "
+                    f"{format_seconds(seconds)} · {flat}",
+                    color,
+                )
+            )
+            if self.interactive:
+                self.status.begin(f"{self._worker_label(data)}: работает")
+
+    def _handle_subagent(self, kind: str, data: dict) -> None:
+        if kind == "subagent_start":
+            count = int(data.get("count") or 0)
+            self.status.write(
+                _style(f"  ╭─ помощники: {count} задач(и) параллельно", "35")
+            )
+        elif kind == "subagent_task_queued":
+            task = preview(str(data.get("task") or ""), 110)
+            self.status.write(
+                _style(f"  │ [{self._worker_label(data)}] в очереди: {task}", "34")
+            )
+        elif kind == "subagent_task_start":
+            task = preview(str(data.get("task") or ""), 110)
+            self.status.write(
+                _style(f"  │ [{self._worker_label(data)}] старт: {task}", "35")
+            )
+            self.status.begin(f"{self._worker_label(data)}: работает")
+        elif kind == "subagent_task_done":
+            ok = bool(data.get("ok"))
+            color = "32" if ok else "31"
+            state = "готово" if ok else "ошибка"
+            seconds = float(data.get("seconds") or 0)
+            output = preview(str(data.get("output") or "").replace("\n", " "), 140)
+            self.status.write(
+                _style(
+                    f"  │ [{self._worker_label(data)}] {state} · "
+                    f"{format_seconds(seconds)} · {output}",
+                    color,
+                )
+            )
+        elif kind == "subagent_end":
+            seconds = float(data.get("seconds") or 0)
+            ok_count = int(data.get("ok") or 0)
+            failed = int(data.get("failed") or 0)
+            color = "32" if failed == 0 else "33"
+            self.status.write(
+                _style(
+                    f"  ╰─ помощники: {ok_count} ок, {failed} с ошибкой · "
+                    f"{format_seconds(seconds)}",
+                    color,
+                )
+            )
+
     def handle(self, kind: str, data: dict) -> None:
+        with self._lock:
+            self._handle(kind, data)
+
+    def _handle(self, kind: str, data: dict) -> None:
         depth = int(data.get("depth") or 0)
         prefix = "подагент: " if depth else ""
         if kind == "start":
+            self._close_stream()
             if depth == 0:
+                self._last_stream = ""
                 self.step = 0
                 self._root_started = time.monotonic()
                 self._summary = ""
-            self.status.begin("готовлюсь к работе")
+                self.status.begin("готовлюсь к работе")
+            elif self.interactive:
+                self.status.begin(f"{self._worker_label(data)}: подключился")
         elif kind == "step":
+            self._close_stream()
             step_no = int(data.get("step") or 0)
             if depth == 0:
                 self.step = step_no
-            self.status.begin(
-                f"{prefix}думаю, шаг {step_no}/{self.settings.max_steps}",
-                self._llm_estimate(),
-            )
+                self.status.begin(
+                    f"{prefix}думаю, шаг {step_no}/{self.settings.max_steps}",
+                    self._llm_estimate(),
+                )
+        elif kind == "token":
+            if depth == 0:
+                self._write_token(str(data.get("text") or ""))
         elif kind == "llm_done":
+            self._close_stream()
             self.metrics.observe(
                 "llm",
                 self.settings.llm.model,
                 float(data.get("seconds") or 0),
             )
         elif kind == "tool_call":
-            name = str(data.get("name") or "инструмент")
-            args = json.dumps(data.get("args", {}), ensure_ascii=False, default=str)
-            self.status.write(_style(f"  > {name} {preview(args, 150)}", "2"))
-            self.status.begin(
-                f"{prefix}выполняю {name}",
-                self.metrics.average(
-                    "tool", name, default=default_tool_seconds(name)
-                ),
-            )
+            self._close_stream()
+            self._handle_tool_call(data, depth)
         elif kind == "tool_result":
-            name = str(data.get("name") or "инструмент")
-            self.metrics.observe("tool", name, float(data.get("seconds") or 0))
-            if data.get("ok"):
-                self.status.write(
-                    _style(f"  < ok: {preview(str(data.get('output', '')), 170)}", "2")
-                )
-            else:
-                self.status.write(
-                    _style(f"  < err: {preview(str(data.get('output', '')), 220)}", "31")
-                )
+            self._close_stream()
+            self._handle_tool_result(data, depth)
+        elif kind.startswith("subagent_"):
+            self._close_stream()
+            self._handle_subagent(kind, data)
         elif kind == "notice":
+            self._close_stream()
             self.status.write(_style(f"  ! {data.get('text', '')}", "33"))
             if self.step:
                 self.status.begin(
@@ -251,12 +545,15 @@ class ConsoleRenderer:
                     self._llm_estimate(),
                 )
         elif kind == "limit":
+            self._close_stream()
             self.status.write(_style("  ! достигнут лимит шагов", "31"))
         elif kind == "answer":
+            self._close_stream()
             if depth == 0:
                 self._finish_turn("готово")
                 self.status.end()
         elif kind == "end":
+            self._close_stream()
             if depth == 0:
                 self._finish_turn("остановлено")
                 self.status.end()
@@ -267,18 +564,23 @@ def _make_agent(
     auto: bool,
     profile: Profile | None = None,
     skill: str = "",
+    renderer=None,
+    line_input=None,
 ) -> tuple[Agent, dict, ConsoleRenderer]:
     state = {"auto": auto}
-    renderer = ConsoleRenderer(settings)
+    renderer = renderer or ConsoleRenderer(settings)
+    prompt = line_input or input
+    confirm_lock = threading.Lock()
 
     def confirm(description: str) -> bool:
         if state["auto"]:
             return True
-        renderer.status.write(_style(f"\n  [!] {description}", "33"))
-        try:
-            answer = input("      Разрешить? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
+        with confirm_lock:
+            renderer.status.write(_style(f"\n  [!] {description}", "33"))
+            try:
+                answer = prompt("      Разрешить? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return False
         return answer in ("y", "yes", "да", "д")
 
     agent = Agent(
@@ -327,7 +629,8 @@ def cmd_ask(
         return 2
     finally:
         renderer.status.end()
-    print(f"\n{answer}")
+    if not renderer.answer_visible(answer):
+        print(f"\n{answer}")
     summary = renderer.summary()
     if summary and renderer.interactive:
         print(_style(f"  {summary}", "2"))
@@ -343,13 +646,24 @@ _HELP = """Команды:
   /agent <id>        переключить роль (например, scout или pentester)
   /model <id>        сменить модель до конца сессии
   /memory [n]        последние факты из памяти
+  /lessons [n]       последние уроки самообучения
   /skills            список навыков
   /skill <name>      показать текст навыка
   /use <name>        подключить навык к текущей сессии
   /teach <текст>     сохранить факт в долговременную память
   /scope             показать авторизованный скоуп пентеста
+  /plan              план текущей задачи и прогресс
+  /stats             статистика сессии и инструментов
+  /worker <задача>   добавить фонового помощника на ходу (можно ; несколько)
+  /workers           состояние фоновых помощников и их отчёты
+  /export            сохранить диалог в workspace/reports
+  /clear             очистить экран диалога (панель)
   /session           путь журнала текущей сессии
-  /exit              выход"""
+  /exit              выход
+
+Панель: слева план, прогресс, помощники и инструменты; справа диалог.
+PgUp/PgDn — прокрутка, ↑/↓ — история, Tab — автодополнение, Ctrl+L — очистка.
+Отключить панель: set ATLAS_NO_PANEL=1"""
 
 
 def cmd_repl(
@@ -360,10 +674,25 @@ def cmd_repl(
 ) -> int:
     active = profile
     current_skill = skill or (profile.skill if profile else "")
-    agent, state, renderer = _make_agent(
-        settings, auto, profile=profile, skill=current_skill
-    )
     log = SessionLog(settings)
+
+    panel = PanelSession(settings, auto=auto) if PanelSession.available() else None
+    if panel is not None and not panel.open():
+        panel = None
+    renderer = panel.renderer if panel is not None else ConsoleRenderer(settings)
+    agent, state, renderer = _make_agent(
+        settings,
+        auto,
+        profile=profile,
+        skill=current_skill,
+        renderer=renderer,
+        line_input=panel.read_line if panel is not None else None,
+    )
+    if panel is not None:
+        panel.session_log_path = log.path
+        panel.bind(agent)
+        panel.welcome()
+
     log.write(
         {
             "type": "start",
@@ -373,124 +702,232 @@ def cmd_repl(
         }
     )
     memory = Memory(settings.data_path / "memory.jsonl")
+    lessons = Lessons(settings.data_path / "lessons.jsonl")
 
-    print(_style(f"{settings.name} {__version__} — локальный автономный агент", "1"))
-    print(f"Рабочая папка: {settings.workspace_path}")
-    print(f"Модель: {settings.llm.model}  ({settings.llm.base_url})")
-    print(f"Память: {len(memory.all())} фактов | Навыки: {len(Skills(settings.skills_path).list())}")
-    if active and active.instruction:
-        print(_style(f"Агент: {active.name} — {active.tagline}", "36"))
-    if current_skill:
-        print(_style(f"Активный навык: {current_skill}", "36"))
-    print("Напиши задачу или /help. Выход: /exit.")
+    def say(text: str = "", style: str = "") -> None:
+        if panel is not None:
+            panel.say(text, style)
+        else:
+            print(text)
 
-    while True:
-        try:
-            line = input(_style("\nты > ", "36")).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nПока.")
-            return 0
-        if not line:
-            continue
+    def read_command() -> str:
+        if panel is not None:
+            return panel.read_line()
+        return input(_style("\nты > ", "36"))
 
-        if line.startswith("/"):
-            action, _, argument = line.partition(" ")
-            action = action.lower()
-            argument = argument.strip()
-            if action in ("/exit", "/quit", "/q"):
-                print("Пока.")
-                return 0
-            if action == "/help":
-                print(_HELP)
-            elif action == "/reset":
-                agent.reset()
-                print("Контекст очищен.")
-            elif action == "/yes":
-                state["auto"] = not state["auto"]
-                print(f"Авто-подтверждение: {'ВКЛ' if state['auto'] else 'ВЫКЛ'}")
-            elif action == "/agents":
-                for item in PROFILES:
-                    marker = "*" if active and item.id == active.id else " "
-                    print(f" {marker} {item.id:<10} {item.name} — {item.tagline}")
-            elif action == "/agent":
-                found = get_profile(argument) if argument else None
-                if not found:
-                    print("Неизвестный агент. Список: /agents")
-                else:
-                    active = found
-                    current_skill = found.skill
-                    agent.set_role(found.name, found.instruction, found.skill)
-                    print(f"Агент: {found.name} — {found.tagline}")
-                    if current_skill:
-                        print(f"Активный навык: {current_skill}")
-            elif action == "/model":
-                if argument:
-                    agent.set_model(argument)
-                    print(f"Модель: {argument}")
-                else:
-                    print(f"Текущая модель: {settings.llm.model}")
-            elif action == "/memory":
-                limit = int(argument) if argument.isdigit() else 12
-                records = memory.recent(max(1, min(50, limit)))
-                if not records:
-                    print("Память пуста.")
-                for record in records:
-                    print(f"  {record['id']}  {record['text']}")
-            elif action == "/skills":
-                skills = Skills(settings.skills_path).list()
-                if not skills:
-                    print("Навыков пока нет.")
-                for item in skills:
-                    marker = "*" if item.name == current_skill else " "
-                    print(f" {marker} {item.name}: {item.description}")
-            elif action == "/skill":
-                found = Skills(settings.skills_path).get(argument) if argument else None
-                if not found:
-                    print("Навык не найден. Список: /skills")
-                else:
-                    print(found[1])
-                    print(f"\nПодключить к сессии: /use {found[0].name}")
-            elif action == "/use":
-                found = Skills(settings.skills_path).get(argument) if argument else None
-                if not found:
-                    print("Навык не найден. Список: /skills")
-                else:
-                    current_skill = found[0].name
-                    agent.set_skill(current_skill)
-                    print(f"Активный навык: {current_skill}")
-            elif action == "/teach":
-                if not argument:
-                    print("Использование: /teach <факт>")
-                else:
-                    record = memory.add(argument, ["repl"])
-                    print(f"Запомнено ({record['id']}).")
-            elif action == "/scope":
-                print(load_scope(settings.data_path).summary())
-            elif action == "/session":
-                print(str(log.path))
-            else:
-                print("Неизвестная команда. Список: /help")
-            continue
+    if panel is None:
+        print(_style(f"{settings.name} {__version__} — локальный автономный агент", "1"))
+        print(f"Рабочая папка: {settings.workspace_path}")
+        print(f"Модель: {settings.llm.model}  ({settings.llm.base_url})")
+        print(
+            f"Память: {len(memory.all())} фактов | "
+            f"Навыки: {len(Skills(settings.skills_path).list())} | "
+            f"Уроки: {lessons.count()}"
+        )
+        if active and active.instruction:
+            print(_style(f"Агент: {active.name} — {active.tagline}", "36"))
+        if current_skill:
+            print(_style(f"Активный навык: {current_skill}", "36"))
+        print("Напиши задачу или /help. Выход: /exit.")
 
-        try:
-            answer = agent.ask(line)
-        except LLMError as exc:
-            print(f"\nОшибка модели:\n{exc}", file=sys.stderr)
-            continue
-        except KeyboardInterrupt:
-            print("\n[прервано]")
-            continue
-        except Exception as exc:
-            print(f"\n[ошибка] {type(exc).__name__}: {exc}", file=sys.stderr)
-            continue
-        finally:
-            renderer.status.end()
-        print(f"\n{settings.name} > {answer}")
-        summary = renderer.summary()
-        if summary and renderer.interactive:
-            print(_style(f"  {summary}", "2"))
-        log.write({"type": "turn", "user": line, "assistant": answer})
+    try:
+        while True:
+            try:
+                line = read_command().strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
 
+            if line.startswith("/"):
+                action, _, argument = line.partition(" ")
+                action = action.lower()
+                argument = argument.strip()
+                if action in ("/exit", "/quit", "/q"):
+                    break
+                if action == "/help":
+                    say(_HELP)
+                elif action == "/reset":
+                    agent.reset()
+                    say("Контекст очищен.")
+                elif action == "/yes":
+                    state["auto"] = not state["auto"]
+                    if panel is not None:
+                        panel.set_auto(bool(state["auto"]))
+                    say(f"Авто-подтверждение: {'ВКЛ' if state['auto'] else 'ВЫКЛ'}")
+                elif action == "/agents":
+                    lines = ["Агенты:"]
+                    for item in PROFILES:
+                        marker = "*" if active and item.id == active.id else " "
+                        lines.append(f" {marker} {item.id:<10} {item.name} — {item.tagline}")
+                    say("\n".join(lines))
+                elif action == "/agent":
+                    found = get_profile(argument) if argument else None
+                    if not found:
+                        say("Неизвестный агент. Список: /agents")
+                    else:
+                        active = found
+                        current_skill = found.skill
+                        agent.set_role(found.name, found.instruction, found.skill)
+                        say(f"Агент: {found.name} — {found.tagline}")
+                        if current_skill:
+                            say(f"Активный навык: {current_skill}")
+                elif action == "/model":
+                    if argument:
+                        agent.set_model(argument)
+                        say(f"Модель: {argument}")
+                    else:
+                        say(f"Текущая модель: {settings.llm.model}")
+                elif action == "/memory":
+                    limit = int(argument) if argument.isdigit() else 12
+                    records = memory.recent(max(1, min(50, limit)))
+                    if not records:
+                        say("Память пуста.")
+                    else:
+                        say("\n".join(f"  {record['id']}  {record['text']}" for record in records))
+                elif action == "/lessons":
+                    limit = int(argument) if argument.isdigit() else 10
+                    records = lessons.recent(max(1, min(50, limit)))
+                    if not records:
+                        say("Уроков пока нет.")
+                    else:
+                        lines = []
+                        for record in records:
+                            lines.append(f"  {record['id']}  {record.get('problem', '')}")
+                            lines.append(f"        -> {record.get('solution', '')}")
+                        say("\n".join(lines))
+                elif action == "/skills":
+                    skills = Skills(settings.skills_path).list()
+                    if not skills:
+                        say("Навыков пока нет.")
+                    else:
+                        lines = ["Навыки:"]
+                        for item in skills:
+                            marker = "*" if item.name == current_skill else " "
+                            lines.append(f" {marker} {item.name}: {item.description}")
+                        say("\n".join(lines))
+                elif action == "/skill":
+                    found = Skills(settings.skills_path).get(argument) if argument else None
+                    if not found:
+                        say("Навык не найден. Список: /skills")
+                    else:
+                        if panel is not None:
+                            panel.markdown(found[1])
+                            say(f"Подключить к сессии: /use {found[0].name}")
+                        else:
+                            print(found[1])
+                            print(f"\nПодключить к сессии: /use {found[0].name}")
+                elif action == "/use":
+                    found = Skills(settings.skills_path).get(argument) if argument else None
+                    if not found:
+                        say("Навык не найден. Список: /skills")
+                    else:
+                        current_skill = found[0].name
+                        agent.set_skill(current_skill)
+                        say(f"Активный навык: {current_skill}")
+                elif action == "/teach":
+                    if not argument:
+                        say("Использование: /teach <факт>")
+                    else:
+                        record = memory.add(argument, ["repl"])
+                        say(f"Запомнено ({record['id']}).")
+                elif action == "/scope":
+                    say(load_scope(settings.data_path).summary())
+                    if panel is not None:
+                        panel.refresh_environment()
+                elif action == "/plan":
+                    if panel is not None:
+                        panel.show_plan()
+                    else:
+                        say("План показывает левая панель интерактивного чата.")
+                elif action == "/stats":
+                    if panel is not None:
+                        panel.show_stats()
+                    else:
+                        say("Статистика доступна в интерактивной панели.")
+                elif action == "/worker":
+                    if not argument:
+                        say(
+                            "Использование: /worker <задача> [; задача2 ...]\n"
+                            "Помощники работают в фоне: /workers — статус, /plan — план."
+                        )
+                    else:
+                        tasks = [
+                            part.strip()
+                            for part in re.split(r"[;\n]+", argument)
+                            if part.strip()
+                        ]
+                        try:
+                            records = add_background_workers(agent.ctx, tasks)
+                        except ToolError as exc:
+                            say(f"Не удалось добавить помощников: {exc}", "31")
+                        else:
+                            ids = ", ".join(f"#{record.id}" for record in records)
+                            say(
+                                f"Добавлено помощников: {len(records)} ({ids}). "
+                                "Работают в фоне — /workers покажет статус."
+                            )
+                            if panel is not None:
+                                panel.phase = "помощники"
+                elif action == "/workers":
+                    if panel is not None:
+                        panel.show_workers()
+                    else:
+                        try:
+                            say(execute_tool("worker_status", {}, agent.ctx))
+                        except ToolError as exc:
+                            say(f"Не удалось получить статус: {exc}", "31")
+                elif action == "/export":
+                    if panel is not None:
+                        try:
+                            path = panel.export_markdown()
+                            say(f"Диалог сохранён: {path}")
+                        except OSError as exc:
+                            say(f"Не удалось сохранить: {exc}", "31")
+                    else:
+                        say("Экспорт доступен в интерактивной панели.")
+                elif action == "/clear":
+                    if panel is not None:
+                        panel.clear_transcript()
+                    else:
+                        say("Очистка экрана доступна в интерактивной панели.")
+                elif action == "/session":
+                    say(str(log.path))
+                else:
+                    say("Неизвестная команда. Список: /help")
+                continue
+
+            try:
+                if panel is not None:
+                    panel.begin_turn(line)
+                answer = agent.ask(line)
+            except LLMError as exc:
+                say(f"Ошибка модели:\n{exc}", "31")
+                continue
+            except KeyboardInterrupt:
+                say("[прервано]")
+                continue
+            except Exception as exc:
+                say(f"[ошибка] {type(exc).__name__}: {exc}", "31")
+                continue
+            finally:
+                renderer.status.end()
+            if not renderer.answer_visible(answer):
+                if panel is not None:
+                    panel.say(f"{settings.name} > {answer}")
+                else:
+                    print(f"\n{settings.name} > {answer}")
+            summary = renderer.summary()
+            if summary and renderer.interactive and panel is None:
+                print(_style(f"  {summary}", "2"))
+            log.write({"type": "turn", "user": line, "assistant": answer})
+    finally:
+        if panel is not None:
+            panel.close()
+
+    print("\nПока.")
+    if panel is not None and panel.last_export is not None:
+        print(f"Диалог сохранён: {panel.last_export}")
     return 0
 
 
@@ -566,7 +1003,7 @@ def cmd_config(settings: Settings, args) -> int:
         raw: dict = {}
         if path.exists():
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8-sig"))
             except json.JSONDecodeError as exc:
                 print(f"config.json повреждён: {exc}")
                 return 1

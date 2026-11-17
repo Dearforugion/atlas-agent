@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+import urllib.request
 
 from .llm import LLM
 from .settings import ROOT, Settings
@@ -49,11 +49,27 @@ def run_doctor(settings: Settings) -> int:
     print(f"Инструментов: {len(TOOLS)}")
     print(f"Навыков: {len(list(settings.skills_path.glob('*.md')))}")
 
+    online, detail = _check_internet()
+    if online:
+        print("Интернет: ОК (example.com доступен; web_search/web_fetch могут выходить в сеть)")
+    else:
+        print(f"Интернет: НЕДОСТУПЕН ({detail})")
+        print("  Проверь прокси, DNS и файрвол: без сети не работают web_search и web_fetch.")
+
     memory_file = settings.data_path / "memory.jsonl"
     memory_count = 0
     if memory_file.exists():
         memory_count = sum(1 for line in memory_file.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
     print(f"Записей в памяти: {memory_count}")
+    lessons_file = settings.data_path / "lessons.jsonl"
+    lessons_count = 0
+    if lessons_file.exists():
+        lessons_count = sum(
+            1
+            for line in lessons_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        )
+    print(f"Уроков самообучения: {lessons_count}")
 
     print(f"\nМодель: {settings.llm.model}")
     print(f"API: {settings.llm.base_url}")
@@ -78,6 +94,20 @@ def run_doctor(settings: Settings) -> int:
 
     print("\nИтог: " + ("есть проблемы, см. выше." if problems else "всё готово."))
     return problems
+
+
+def _check_internet() -> tuple[bool, str]:
+    """Проверяет обычный выход в интернет, который используют web-инструменты."""
+    request = urllib.request.Request(
+        "https://example.com",
+        headers={"User-Agent": "ATLAS-doctor/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read(512)
+        return True, ""
+    except Exception as exc:  # сеть бывает очень разной
+        return False, str(exc)
 
 
 def _same_model(requested: str, available: str) -> bool:

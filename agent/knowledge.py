@@ -92,6 +92,119 @@ class Memory:
         tmp.replace(self.path)
 
 
+class Lessons:
+    """Уроки самообучения: проблема -> проверенное решение.
+
+    В отличие от памяти (факты) и навыков (методики), урок фиксирует
+    конкретную ошибку и способ её исправления, чтобы агент не повторял
+    её в следующий раз.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _load(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        records: list[dict] = []
+        for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("problem") and record.get("solution"):
+                records.append(record)
+        return records
+
+    def _rewrite(self, records: list[dict]) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        tmp.replace(self.path)
+
+    def add(
+        self,
+        problem: str,
+        solution: str,
+        tags: list[str] | None = None,
+        source: str = "",
+    ) -> tuple[dict, bool]:
+        problem = str(problem).strip()
+        solution = str(solution).strip()
+        if not problem or not solution:
+            raise ValueError("Нужны problem и solution.")
+        records = self._load()
+        key = problem.lower()
+        for record in records:
+            if str(record.get("problem", "")).lower() == key:
+                record.update(
+                    {
+                        "ts": now_iso(),
+                        "solution": solution,
+                        "tags": [str(tag) for tag in (tags or record.get("tags") or [])],
+                        "source": str(source or record.get("source") or ""),
+                    }
+                )
+                self._rewrite(records)
+                return record, False
+        record = {
+            "id": uuid.uuid4().hex[:8],
+            "ts": now_iso(),
+            "problem": problem,
+            "solution": solution,
+            "tags": [str(tag) for tag in (tags or [])],
+            "source": str(source or ""),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record, True
+
+    def recent(self, limit: int = 10) -> list[dict]:
+        records = self._load()
+        return records[-limit:] if limit > 0 else []
+
+    def all(self) -> list[dict]:
+        return self._load()
+
+    def count(self) -> int:
+        return len(self._load())
+
+    def search(self, query: str, limit: int = 5) -> list[dict]:
+        query_lower = str(query).strip().lower()
+        if not query_lower:
+            return []
+        tokens = [token for token in re.findall(r"\w+", query_lower) if len(token) > 1]
+        scored: list[tuple[int, dict]] = []
+        for record in self._load():
+            haystack = " ".join(
+                str(record.get(field, "")).lower()
+                for field in ("problem", "solution", "source", "tags")
+            )
+            score = 0
+            if query_lower in haystack:
+                score += 5
+            for token in tokens:
+                if token in haystack:
+                    score += 1
+            if score:
+                scored.append((score, record))
+        scored.sort(key=lambda item: (item[0], item[1].get("ts", "")), reverse=True)
+        return [record for _, record in scored[:limit]]
+
+    def forget(self, record_id: str) -> bool:
+        records = self._load()
+        kept = [record for record in records if record.get("id") != record_id]
+        if len(kept) == len(records):
+            return False
+        self._rewrite(kept)
+        return True
+
+
 @dataclass
 class SkillMeta:
     name: str

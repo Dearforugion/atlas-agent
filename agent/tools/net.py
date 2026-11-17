@@ -6,6 +6,7 @@ TCP connect-скан через стандартную библиотеку. П�
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -18,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 from ..errors import ToolError
+from ..paths import ensure_path, gate_if_outside
+from ..safety import is_private_host
 from ..scope import is_local_lab_target, load_scope, normalize_target
 from ..utils import write_text
 from . import tool
@@ -435,3 +438,151 @@ def whois_lookup(args: dict, ctx) -> str:
         lines.append(f"DNSSEC: {'подписан' if signed else 'не подписан'}")
 
     return "\n".join(lines)
+
+
+def _human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if value < 1024 or unit == "ГБ":
+            return f"{value:.1f} {unit}" if unit != "Б" else f"{int(value)} Б"
+        value /= 1024
+    return f"{num_bytes} Б"
+
+
+def _safe_filename(name: str) -> str:
+    name = urllib.parse.unquote(name or "").strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
+    if name in ("", ".", ".."):
+        return "download.bin"
+    # Ведущая точка сохраняется: агенту иногда нужны .env и подобные файлы.
+    return name[:120]
+
+
+@tool(
+    "download_file",
+    "Скачать файл по http(s)-ссылке в рабочую папку. Подходит для установщиков, "
+    "словарей, бинарников и датасетов: проверяет размер, считает SHA-256 и не "
+    "оставляет недокачанных файлов.",
+    {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Полная http(s)-ссылка на файл"},
+            "path": {
+                "type": "string",
+                "description": "Куда сохранить относительно рабочей папки. Если не указано — имя из ссылки",
+            },
+            "overwrite": {"type": "boolean", "description": "Перезаписать существующий файл"},
+            "max_mb": {
+                "type": "integer",
+                "description": "Максимальный размер в МБ (по умолчанию 500, максимум 4096)",
+            },
+        },
+        "required": ["url"],
+    },
+)
+def download_file(args: dict, ctx) -> str:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        raise ToolError("Пустая ссылка.")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ToolError("Разрешены только http/https-ссылки.")
+    if not parsed.hostname:
+        raise ToolError("В ссылке нет имени хоста.")
+
+    max_mb = max(1, min(4096, int(args.get("max_mb") or 500)))
+    max_bytes = max_mb * 1024 * 1024
+
+    raw_path = str(args.get("path") or "").strip()
+    if raw_path:
+        target = ensure_path(ctx, raw_path)
+        if target.is_dir() or raw_path.endswith(("/", "\\")):
+            target = target / _safe_filename(Path(parsed.path).name)
+    else:
+        target = ensure_path(ctx, _safe_filename(Path(parsed.path).name))
+
+    gate_if_outside(ctx, target, "Скачивание файла")
+    if target.exists() and not bool(args.get("overwrite")):
+        raise ToolError(
+            f"Файл уже существует: {target}. Укажи overwrite=true, чтобы заменить."
+        )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        },
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + ".part")
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            final_url = response.geturl()
+            final = urllib.parse.urlparse(final_url)
+            if final.scheme not in ("http", "https") or not final.hostname:
+                raise ToolError(f"Редирект на недопустимый адрес: {final_url}")
+            if is_private_host(final.hostname) and not ctx.settings.allow_private_web:
+                raise ToolError(
+                    f"Редирект в локальную сеть запрещён: {final_url}. "
+                    "Включи allow_private_web в config.json, если это лабораторный сервер."
+                )
+            length_header = response.headers.get("Content-Length")
+            if length_header and length_header.isdigit():
+                declared = int(length_header)
+                if declared > max_bytes:
+                    raise ToolError(
+                        f"Файл слишком большой: {_human_size(declared)} "
+                        f"(лимит {max_mb} МБ). Увеличь max_mb."
+                    )
+            with temp.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ToolError(
+                            f"Файл превысил лимит {max_mb} МБ — скачивание остановлено."
+                        )
+                    digest.update(chunk)
+                    handle.write(chunk)
+    except ToolError:
+        temp.unlink(missing_ok=True)
+        raise
+    except urllib.error.HTTPError as exc:
+        temp.unlink(missing_ok=True)
+        raise ToolError(f"Сайт вернул HTTP {exc.code}: {url}") from exc
+    except urllib.error.URLError as exc:
+        temp.unlink(missing_ok=True)
+        raise ToolError(f"Не удалось скачать {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        temp.unlink(missing_ok=True)
+        raise ToolError(f"Таймаут при скачивании {url}.") from exc
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ToolError(f"Ошибка записи файла {target}: {exc}") from exc
+
+    if total == 0:
+        temp.unlink(missing_ok=True)
+        raise ToolError(f"Сервер вернул пустой файл: {url}")
+
+    temp.replace(target)
+    sha256 = digest.hexdigest()
+    ctx.audit.write(
+        "download_file",
+        url=final_url,
+        path=str(target),
+        bytes=total,
+        sha256=sha256,
+    )
+    return (
+        f"Скачано: {target}\n"
+        f"URL: {final_url}\n"
+        f"Размер: {_human_size(total)}\n"
+        f"SHA-256: {sha256}"
+    )
